@@ -6,5 +6,5 @@ import type { AppType } from "../local-api";
 // fetch をオーバーライドして app.fetch() に差し替えることで
 // ネットワークを介さず SQLite に到達する。
 export const localClient = hc<AppType>("http://local", {
-  fetch: (input, init) => app.fetch(new Request(input, init)),
+  fetch: (input: RequestInfo | URL, init?: RequestInit) => app.fetch(new Request(input, init)),
 });

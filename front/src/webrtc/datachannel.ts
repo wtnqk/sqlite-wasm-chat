@@ -5,6 +5,14 @@
 //   - DataChannel でメッセージを送受信する
 //   - 受信メッセージを Hono local API 経由で SQLite に保存する
 //   - rtcState / signalingState を更新する
+//
+// WebRTC 接続の流れ:
+//   1. startConnection() でシグナリングサーバーに接続し "waiting" 状態になる
+//   2. 相手が同じルームに来たらシグナリングサーバーから "ready" が届く
+//   3. ready を受け取った側 (offerer) が Offer を作成して送る
+//   4. 相手 (answerer) が Answer を返す
+//   5. 両者が ICE candidate を交換して P2P 経路を確立する
+//   6. DataChannel が open になったらハンドシェイクを送り "connected" になる
 
 import { signal } from "@preact/signals";
 import { connect } from "./signaling";
@@ -13,11 +21,20 @@ import { localClient } from "../lib/client";
 import { notify } from "../db/store";
 import { getMyPeerId, getMyName } from "../lib/session";
 
+/**
+ * STUN サーバーの設定。
+ * ICE (Interactive Connectivity Establishment) が P2P 経路を探す際に使う。
+ * STUN サーバーは自分のグローバル IP アドレスを教えてくれる役割を持つ。
+ */
 const ICE_SERVERS: RTCIceServer[] = [
   { urls: "stun:stun.l.google.com:19302" },
 ];
 
-// DataChannel 上でやり取りするペイロードの型
+/**
+ * DataChannel 上でやり取りするペイロードの型。
+ * - handshake: 接続直後に相手のピアIDと表示名を交換するために使う
+ * - message: チャットメッセージ本体
+ */
 type DCPayload =
   | { type: "handshake"; peerId: string; name: string }
   | {
@@ -29,15 +46,29 @@ type DCPayload =
       sent_at: number;
     };
 
+/**
+ * UI 層が DataChannel を操作するためのインターフェース。
+ * `connection` signal にセットされ、ChatPage から参照される。
+ */
 export type Connection = {
+  /** メッセージを DataChannel 経由で相手に送信し、自分の SQLite にも保存する */
   sendMessage: (body: string) => Promise<void>;
+  /** DataChannel と RTCPeerConnection を閉じる */
   close: () => void;
 };
 
-// connection は UI から sendMessage / close を呼ぶための Signal。
-// DataChannel が open になると値がセットされる。
+/**
+ * UI から sendMessage / close を呼ぶための Signal。
+ * DataChannel が open になると Connection オブジェクトがセットされる。
+ * 未接続または切断後は null。
+ */
 export const connection = signal<Connection | null>(null);
 
+/**
+ * WebRTC 接続を開始する。
+ * 自分をピアとして SQLite に登録し、シグナリングサーバー経由で相手との P2P 接続を確立する。
+ * ChatPage のマウント時に一度だけ呼ばれる。
+ */
 export async function startConnection(roomId: string): Promise<void> {
   const myPeerId = getMyPeerId();
   const myName = getMyName() ?? "Anonymous";
@@ -52,12 +83,17 @@ export async function startConnection(roomId: string): Promise<void> {
   let dc: RTCDataChannel | null = null;
   let remotePeerId: string | null = null;
 
+  /**
+   * offerer / answerer 両方で共通の DataChannel イベントを設定する。
+   * - offerer: createDataChannel() で作成したチャンネルを渡す
+   * - answerer: ondatachannel イベントで受け取ったチャンネルを渡す
+   */
   function setupDataChannel(channel: RTCDataChannel): void {
     dc = channel;
 
     channel.onopen = () => {
       rtcState.value = "connected";
-      // 接続確立直後にハンドシェイクを送り、相手のピアIDと名前を知らせる
+      // 接続確立直後にハンドシェイクを送り、相手に自分のピアIDと名前を知らせる
       channel.send(
         JSON.stringify({ type: "handshake", peerId: myPeerId, name: myName }),
       );
@@ -67,6 +103,7 @@ export async function startConnection(roomId: string): Promise<void> {
       const payload = JSON.parse(data) as DCPayload;
 
       if (payload.type === "handshake") {
+        // 相手のピア情報を SQLite に登録して表示名を解決できるようにする
         remotePeerId = payload.peerId;
         await localClient.peers.$post({
           json: {
@@ -80,7 +117,7 @@ export async function startConnection(roomId: string): Promise<void> {
         return;
       }
 
-      // chat message → SQLite に保存
+      // チャットメッセージを SQLite に保存して UI に反映する
       await localClient.messages.$post({ json: payload });
       await notify(roomId);
     };
@@ -95,7 +132,7 @@ export async function startConnection(roomId: string): Promise<void> {
 
   const sigClient = connect(roomId, {
     onReady: async () => {
-      // ready を受け取った側が offerer になる
+      // シグナリングサーバーから "ready" を受け取った側が offerer になり Offer を作成する
       rtcState.value = "connecting";
       const channel = pc.createDataChannel("chat");
       setupDataChannel(channel);
@@ -107,6 +144,7 @@ export async function startConnection(roomId: string): Promise<void> {
     },
 
     onOffer: async (offer) => {
+      // Offer を受け取った側が answerer になり Answer を返す
       rtcState.value = "connecting";
       signalingState.value = "have-remote-offer";
       await pc.setRemoteDescription(offer);
@@ -117,6 +155,7 @@ export async function startConnection(roomId: string): Promise<void> {
     },
 
     onAnswer: async (answer) => {
+      // offerer が Answer を受け取り、シグナリングが完了する
       await pc.setRemoteDescription(answer);
       signalingState.value = "stable";
     },
@@ -130,6 +169,7 @@ export async function startConnection(roomId: string): Promise<void> {
     },
 
     onBye: async () => {
+      // 相手が切断したらピアを切断済みにして UI を更新する
       if (remotePeerId) {
         await localClient.peers[":id"].disconnect.$put({
           param: { id: remotePeerId },
@@ -147,12 +187,12 @@ export async function startConnection(roomId: string): Promise<void> {
     },
   });
 
-  // ICE candidate を相手に送る
+  // ICE candidate が見つかるたびにシグナリング経由で相手に送る
   pc.onicecandidate = ({ candidate }) => {
     if (candidate) sigClient.sendCandidate(candidate.toJSON());
   };
 
-  // answerer 側は ondatachannel で DataChannel を受け取る
+  // answerer 側は ondatachannel で offerer が作成した DataChannel を受け取る
   pc.ondatachannel = ({ channel }) => {
     setupDataChannel(channel);
   };
@@ -171,7 +211,7 @@ export async function startConnection(roomId: string): Promise<void> {
         body,
         sent_at: Date.now(),
       };
-      // 自分の SQLite に先に保存してから相手に送る
+      // 自分の SQLite に先に保存してから相手に送る (送信失敗時も自分の履歴には残る)
       await localClient.messages.$post({ json: msg });
       await notify(roomId);
       dc.send(JSON.stringify(msg));

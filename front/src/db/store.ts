@@ -14,6 +14,6 @@ export async function notify(roomId: string): Promise<void> {
     localClient.messages.$get({ query: { room_id: roomId } }),
     localClient.peers.$get({ query: { connected: "1" } }),
   ]);
-  messages.value = await msgRes.json();
-  peers.value = await peerRes.json();
+  messages.value = (await msgRes.json()) as Message[];
+  peers.value = (await peerRes.json()) as Peer[];
 }
